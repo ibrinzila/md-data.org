@@ -18,10 +18,14 @@ engine = create_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, class_=Session)
 
 
+def create_schema() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
 async def init_db(retries: int = 5, delay: float = 1.0) -> None:
     for attempt in range(1, retries + 1):
         try:
-            Base.metadata.create_all(bind=engine)
+            create_schema()
             return
         except OperationalError as exc:
             logging.warning("Database not ready on attempt %s/%s: %s", attempt, retries, exc)
@@ -32,4 +36,3 @@ async def init_db(retries: int = 5, delay: float = 1.0) -> None:
         except Exception as exc:
             logging.exception("Database initialization failed: %s", exc)
             return
-

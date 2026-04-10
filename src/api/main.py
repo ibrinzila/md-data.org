@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.api.status import router as status_router
 from src.api.v1.router import api_router
 from src.db.session import init_db
 
@@ -28,6 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(status_router)
 app.include_router(api_router, prefix="/v1")
 
 

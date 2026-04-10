@@ -10,5 +10,4 @@ celery_app = Celery(
 celery_app.conf.task_routes = {"src.workers.*": {"queue": "default"}}
 
 # Import worker modules so the task decorators register against celery_app.
-from src.workers import bnm_worker, ckan_worker, igsu_worker, meteo_worker, mtender_worker, nbs_worker  # noqa: E402,F401
-
+from src.workers import bnm_worker, ckan_full_worker, ckan_worker, company_worker, eu_funds_worker, geospatial_worker, igsu_worker, legislation_worker, meteo_worker, mtender_worker, nbs_worker, ngo_worker  # noqa: E402,F401
