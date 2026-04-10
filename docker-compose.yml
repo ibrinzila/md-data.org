@@ -29,6 +29,13 @@ services:
       - db
       - redis
 
+  celery-beat:
+    build: .
+    env_file: .env
+    command: celery -A celery_worker.celery_app beat --loglevel=info --schedule=/tmp/md-data-celerybeat-schedule
+    depends_on:
+      - db
+      - redis
+
 volumes:
   postgres_data:
-

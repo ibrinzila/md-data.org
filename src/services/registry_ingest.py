@@ -239,7 +239,7 @@ def sync_registry_entities(
                             entity_type=entity_type,
                             row=row,
                             source_dataset_id=package_id,
-                            source_url=resource_url or f"https://date.gov.md/dataset/{package_id}",
+                            source_url=resource_url or f"https://dataset.gov.md/en/dataset/{package_id}",
                             fallback_key=f"{package_id}:{index}:{row_index}",
                             title_hint=title_hint,
                         )
@@ -259,7 +259,7 @@ def sync_registry_entities(
                         entity_type=entity_type,
                         row=fallback_row,
                         source_dataset_id=package_id,
-                        source_url=clean_text(detail.get("url") or f"https://date.gov.md/dataset/{package_id}"),
+                        source_url=clean_text(detail.get("url") or f"https://dataset.gov.md/en/dataset/{package_id}"),
                         fallback_key=package_id,
                         title_hint=detail.get("title") or package_id,
                     )

@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api.status import router as status_router
+from src.api.status_page import router as status_router
 from src.api.v1.router import api_router
 from src.db.session import init_db
 

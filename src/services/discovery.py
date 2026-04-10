@@ -35,6 +35,36 @@ STATIC_CATALOG = [
         source="EU Funds",
     ),
     SearchResult(
+        title="Open datasets",
+        description="CKAN datasets from the Government Open Data Portal.",
+        url="/v1/datasets",
+        source="CKAN",
+    ),
+    SearchResult(
+        title="Company register",
+        description="State register of legal entities with IDNO and cross references.",
+        url="/v1/companies/search",
+        source="Companies",
+    ),
+    SearchResult(
+        title="NGO register",
+        description="Non-profit organization registry entries and lookups.",
+        url="/v1/ngos/search",
+        source="NGOs",
+    ),
+    SearchResult(
+        title="Official Gazette",
+        description="Monitorul Oficial editions and article snippets.",
+        url="/v1/legislation/search",
+        source="Legislation",
+    ),
+    SearchResult(
+        title="Geospatial layers",
+        description="Open geo layers, cadastre extracts, and raion boundaries.",
+        url="/v1/geospatial/layers",
+        source="Geospatial",
+    ),
+    SearchResult(
         title="Weather current",
         description="Weather endpoint ready for meteo.md integration.",
         url="/v1/weather/current",
@@ -89,7 +119,7 @@ def build_global_search_results(query: str = "", *, session: Session | None = No
             items.append(
                 SearchResult(
                     title=dataset.title,
-                    description=dataset.notes or f"CKAN dataset from {dataset.organization or 'date.gov.md'}",
+                    description=dataset.notes or f"CKAN dataset from {dataset.organization or 'dataset.gov.md/en'}",
                     url=f"/v1/datasets/{dataset.dataset_id}",
                     source=dataset.organization or "CKAN",
                 )

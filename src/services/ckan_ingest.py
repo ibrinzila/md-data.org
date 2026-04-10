@@ -16,7 +16,14 @@ from src.services.ingest_utils import clean_text, json_safe, parse_datetime, uni
 
 logger = logging.getLogger(__name__)
 
-CKAN_BASE_URL = "https://date.gov.md/api/3/action"
+CKAN_ACTION_BASE_URLS = (
+    "https://dataset.gov.md/en/api/3/action",
+    "https://date.gov.md/api/3/action",
+)
+CKAN_PORTAL_BASE_URLS = (
+    "https://dataset.gov.md/en",
+    "https://date.gov.md",
+)
 HTTP_HEADERS = {"User-Agent": "md-data.org/1.0 (+https://md-data.org)"}
 
 
@@ -41,32 +48,55 @@ def _client() -> httpx.Client:
     return httpx.Client(timeout=30.0, follow_redirects=True, headers=HTTP_HEADERS)
 
 
-def _action_url(action: str) -> str:
-    return f"{CKAN_BASE_URL}/{action}"
+def _action_urls(action: str) -> list[str]:
+    return [f"{base_url}/{action}" for base_url in CKAN_ACTION_BASE_URLS]
+
+
+def _dataset_url(slug: str) -> str:
+    return f"{CKAN_PORTAL_BASE_URLS[0]}/dataset/{slug}"
+
+
+def _request_action(action: str, params: dict[str, Any] | None = None) -> Any:
+    last_error: Exception | None = None
+    with _client() as client:
+        for url in _action_urls(action):
+            try:
+                response = client.get(url, params=params)
+                if response.status_code == 404:
+                    last_error = httpx.HTTPStatusError(
+                        "Not Found",
+                        request=response.request,
+                        response=response,
+                    )
+                    continue
+                response.raise_for_status()
+                payload = response.json()
+                if isinstance(payload, dict):
+                    if "result" in payload:
+                        return payload["result"]
+                    return payload
+                return payload
+            except Exception as exc:
+                last_error = exc
+                continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"CKAN action failed for {action}")
 
 
 def fetch_package_list() -> list[str]:
-    with _client() as client:
-        response = client.get(_action_url("package_list"))
-        response.raise_for_status()
-        payload = response.json()
-        return list(payload.get("result") or [])
+    return list(_request_action("package_list") or [])
 
 
 def fetch_package_show(package_id: str) -> dict[str, Any]:
-    with _client() as client:
-        response = client.get(_action_url("package_show"), params={"id": package_id})
-        response.raise_for_status()
-        payload = response.json()
-        return dict(payload.get("result") or {})
+    return dict(_request_action("package_show", params={"id": package_id}) or {})
 
 
 def search_packages(query: str, rows: int = 50) -> list[dict[str, Any]]:
-    with _client() as client:
-        response = client.get(_action_url("package_search"), params={"q": query, "rows": rows})
-        response.raise_for_status()
-        payload = response.json()
-        return list(payload.get("result", {}).get("results") or [])
+    payload = _request_action("package_search", params={"q": query, "rows": rows})
+    if isinstance(payload, dict):
+        return list(payload.get("results") or [])
+    return []
 
 
 def _dataset_to_schema(record: CKANDatasetRecord) -> CKANDataset:
@@ -109,7 +139,7 @@ def _upsert_dataset(session: Session, package: dict[str, Any]) -> CKANDatasetRec
 
     record = session.scalar(select(CKANDatasetRecord).where(CKANDatasetRecord.dataset_id == dataset_id))
     if record is None:
-        record = CKANDatasetRecord(dataset_id=dataset_id, title=title, slug=slug, source_url=f"https://date.gov.md/dataset/{slug}")
+        record = CKANDatasetRecord(dataset_id=dataset_id, title=title, slug=slug, source_url=_dataset_url(slug))
 
     record.title = title
     record.slug = slug
@@ -117,7 +147,7 @@ def _upsert_dataset(session: Session, package: dict[str, Any]) -> CKANDatasetRec
     record.organization = organization or None
     record.tags = tags
     record.resources = resources
-    record.source_url = clean_text(package.get("url") or f"https://date.gov.md/dataset/{slug}")
+    record.source_url = clean_text(package.get("url") or _dataset_url(slug))
     record.source_modified_at = parse_datetime(package.get("metadata_modified") or package.get("modified"))
     record.raw_payload = json_safe(package)
     record.synced_at = datetime.now(timezone.utc)

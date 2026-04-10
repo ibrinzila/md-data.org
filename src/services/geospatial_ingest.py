@@ -82,7 +82,7 @@ def sync_geospatial_database(*, session: Session | None = None, package_limit: i
                 seen.add(dataset_id)
                 title = clean_text(package.get("title") or dataset_id)
                 description = clean_text(package.get("notes") or package.get("organization", {}).get("title") or "")
-                source_url = clean_text(package.get("url") or f"https://date.gov.md/dataset/{dataset_id}")
+                source_url = clean_text(package.get("url") or f"https://dataset.gov.md/en/dataset/{dataset_id}")
                 _upsert_layer(
                     db,
                     layer_key=dataset_id,

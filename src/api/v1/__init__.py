@@ -1,2 +1,2 @@
-from .router import api_router
+"""API v1 package."""
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections import Counter
 from datetime import datetime, timezone
@@ -12,6 +13,10 @@ from fastapi.responses import HTMLResponse
 from src.api.v1.endpoints.emergencies import get_emergency_alerts
 from src.api.v1.endpoints.eu_funds import funding_statistics, list_projects
 from src.api.v1.endpoints.finance import get_exchange_rates
+from src.services.ckan_ingest import list_datasets
+from src.services.geospatial_ingest import list_layers
+from src.services.legislation_ingest import list_articles, list_editions
+from src.services.registry_ingest import list_entities
 from src.api.v1.endpoints.procurement import (
     list_awards,
     list_budgets,
@@ -42,7 +47,9 @@ def _dump(value: Any) -> Any:
 
 async def _safe_call(label: str, coro: Any, fallback: Any) -> Any:
     try:
-        return await coro
+        if inspect.isawaitable(coro):
+            return await coro
+        return coro
     except Exception:
         logger.exception("status payload component failed: %s", label)
         return fallback
@@ -121,6 +128,551 @@ def _make_story(
         "secondary_label": secondary_label,
         "tone": tone,
     }
+
+
+def _counter_chart(counter: Counter[str], *, unit_label: str, limit: int = 4) -> list[dict[str, Any]]:
+    if not counter:
+        return []
+    max_count = max(counter.values())
+    chart: list[dict[str, Any]] = []
+    for label, count in counter.most_common(limit):
+        chart.append(
+            {
+                "label": label,
+                "value": count,
+                "display": f"{count} {unit_label}",
+                "width": round((count / max_count) * 100) if max_count else 0,
+            }
+        )
+    return chart
+
+
+def _build_datasets_module(datasets: list[dict[str, Any]]) -> dict[str, Any]:
+    datasets_sorted = sorted(
+        datasets,
+        key=lambda item: (item.get("source_modified_at") or datetime.min.replace(tzinfo=timezone.utc), item.get("title") or ""),
+        reverse=True,
+    )
+    organization_counts = Counter((item.get("organization") or "Government Open Data Portal") for item in datasets_sorted)
+    resource_total = sum(len(item.get("resources") or []) for item in datasets_sorted)
+    tag_total = len({tag for dataset in datasets_sorted for tag in (dataset.get("tags") or [])})
+    chart = _counter_chart(organization_counts, unit_label="dataset(s)")
+
+    stories: list[dict[str, Any]] = []
+    if datasets_sorted:
+        dataset = datasets_sorted[0]
+        resource_count = len(dataset.get("resources") or [])
+        stories.append(
+            _make_story(
+                story_id=dataset["dataset_id"],
+                kicker="Dataset",
+                title=dataset["title"],
+                meta=f"{dataset.get('organization') or 'Government Open Data Portal'} · {dataset.get('slug')}",
+                value=f"{resource_count} resource(s)",
+                blurb=dataset.get("notes") or "Open data portal entry with resources, tags, and a source URL.",
+                detail=f"Tags: {', '.join(dataset.get('tags') or []) or 'none'}",
+                route=f"/v1/datasets/{dataset['dataset_id']}",
+                route_label="Open dataset",
+                tags=[dataset.get("organization") or "CKAN", "Open data"],
+                tone="live" if resource_count else "ready",
+            )
+        )
+
+    if len(datasets_sorted) > 1:
+        dataset = datasets_sorted[1]
+        stories.append(
+            _make_story(
+                story_id=f"{dataset['dataset_id']}-secondary",
+                kicker="Dataset",
+                title=dataset["title"],
+                meta=f"{dataset.get('organization') or 'Government Open Data Portal'} · {dataset.get('slug')}",
+                value=f"{len(dataset.get('resources') or [])} resource(s)",
+                blurb=dataset.get("notes") or "Secondary dataset in the open data portal.",
+                detail=f"Source URL: {dataset.get('source_url')}",
+                route=f"/v1/datasets/{dataset['dataset_id']}",
+                route_label="Open dataset",
+                tags=[dataset.get("organization") or "CKAN", "Dataset"],
+                tone="ready",
+            )
+        )
+
+    if not stories:
+        stories.append(
+            _make_story(
+                story_id="datasets-empty",
+                kicker="Dataset",
+                title="No CKAN datasets yet",
+                meta="Waiting for sync",
+                value="—",
+                blurb="The CKAN module will populate when the open data portal has records.",
+                detail="Use the dataset route or the global search index to inspect open data.",
+                route="/v1/datasets",
+                route_label="Open datasets",
+                tags=["Placeholder"],
+                tone="placeholder",
+            )
+        )
+
+    top_org = next(iter(organization_counts.keys()), "Government Open Data Portal")
+    highlights = [
+        f"{len(datasets_sorted)} dataset(s) and {resource_total} resource(s) are indexed from CKAN.",
+        f"{len(organization_counts)} publisher group(s) appear in the visible sample.",
+        f"{tag_total} unique tag(s) provide the first layer of discovery.",
+    ]
+
+    return {
+        "id": "datasets",
+        "kind": "datasets",
+        "kicker": "dataset.gov.md / CKAN",
+        "name": "Open datasets",
+        "state": "live" if datasets_sorted else "placeholder",
+        "detail": f"{len(datasets_sorted)} datasets with {resource_total} resources from {top_org}.",
+        "note": "The portal acts as the source-of-sources layer for the atlas.",
+        "accent": "#d7b6ff",
+        "cross_link_count": 0,
+        "metrics": [
+            {"label": "Datasets", "value": str(len(datasets_sorted)), "hint": "portal records"},
+            {"label": "Organizations", "value": str(len(organization_counts)), "hint": "publishers"},
+            {"label": "Resources", "value": str(resource_total), "hint": "files and feeds"},
+            {"label": "Tags", "value": str(tag_total), "hint": "search facets"},
+        ],
+        "highlights": highlights,
+        "chart": chart,
+        "stories": stories,
+        "routes": [
+            {"label": "Datasets", "href": "/v1/datasets"},
+            {"label": "Discovery", "href": "/v1/search"},
+        ],
+    }
+
+
+def _build_registers_module(companies: list[dict[str, Any]], ngos: list[dict[str, Any]]) -> dict[str, Any]:
+    company_list = sorted(companies, key=lambda item: (item.get("name") or "").lower())
+    ngo_list = sorted(ngos, key=lambda item: (item.get("name") or "").lower())
+    combined = company_list + ngo_list
+    raion_counts = Counter((item.get("raion") or "Unknown") for item in combined if item.get("raion") or item.get("locality"))
+    linked_tenders = sorted(
+        {
+            ocid
+            for entity in combined
+            for ocid in (entity.get("cross_references") or {}).get("tenders", [])
+            if ocid
+        }
+    )
+    linked_projects = sorted(
+        {
+            project_id
+            for entity in combined
+            for project_id in (entity.get("cross_references") or {}).get("eu_projects", [])
+            if project_id
+        }
+    )
+
+    stories: list[dict[str, Any]] = []
+    if company_list:
+        company = company_list[0]
+        company_links = company.get("cross_references") or {}
+        stories.append(
+            _make_story(
+                story_id=company["entity_key"],
+                kicker="Company",
+                title=company["name"],
+                meta=f"{company.get('raion') or 'Unknown raion'} · {company.get('status') or 'active'}",
+                value=company.get("identifier_value") or company.get("entity_id"),
+                blurb=company.get("description") or "Company register entry from the open data portal.",
+                detail=(
+                    f"Linked tenders: {len(company_links.get('tenders') or [])} · "
+                    f"EU projects: {len(company_links.get('eu_projects') or [])}"
+                ),
+                route=f"/v1/companies/{company['entity_id']}",
+                route_label="Open company",
+                secondary_route=f"/v1/companies/search?q={company['entity_id']}",
+                secondary_label="Search company",
+                tags=["Company", company.get("raion") or "Unknown"],
+                tone="live" if company.get("status") else "ready",
+            )
+        )
+
+    if ngo_list:
+        ngo = ngo_list[0]
+        ngo_links = ngo.get("cross_references") or {}
+        stories.append(
+            _make_story(
+                story_id=ngo["entity_key"],
+                kicker="NGO",
+                title=ngo["name"],
+                meta=f"{ngo.get('raion') or 'Unknown raion'} · {ngo.get('status') or 'active'}",
+                value=ngo.get("identifier_value") or ngo.get("entity_id"),
+                blurb=ngo.get("description") or "NGO register entry from the open data portal.",
+                detail=(
+                    f"Linked tenders: {len(ngo_links.get('tenders') or [])} · "
+                    f"EU projects: {len(ngo_links.get('eu_projects') or [])}"
+                ),
+                route=f"/v1/ngos/{ngo['entity_id']}",
+                route_label="Open NGO",
+                secondary_route=f"/v1/ngos/search?q={ngo['entity_id']}",
+                secondary_label="Search NGO",
+                tags=["NGO", ngo.get("raion") or "Unknown"],
+                tone="live" if ngo.get("status") else "ready",
+            )
+        )
+
+    if not stories:
+        stories.append(
+            _make_story(
+                story_id="registers-empty",
+                kicker="Register",
+                title="No registry entries yet",
+                meta="Waiting for sync",
+                value="—",
+                blurb="The company and NGO register module will populate once the CKAN-backed sync runs.",
+                detail="Search by IDNO, registration number, or name once records are available.",
+                route="/v1/companies/search?q=",
+                route_label="Open company search",
+                tags=["Placeholder"],
+                tone="placeholder",
+            )
+        )
+
+    highlights = [
+        f"{len(company_list)} company profile(s) and {len(ngo_list)} NGO profile(s) are surfaced together.",
+        f"{len(linked_tenders)} tender(s) and {len(linked_projects)} EU project(s) are cross-linked from the register view.",
+        "Search by name, IDNO, registration number, raion, or locality.",
+    ]
+
+    return {
+        "id": "registers",
+        "kind": "registers",
+        "kicker": "Companies / NGOs",
+        "name": "Core registers",
+        "state": "live" if combined else "placeholder",
+        "detail": f"{len(company_list)} companies and {len(ngo_list)} NGOs with procurement and EU cross-links.",
+        "note": "One register lens for legal entities and civil society organizations.",
+        "accent": "#76f0bf",
+        "cross_link_count": len(linked_tenders) + len(linked_projects),
+        "metrics": [
+            {"label": "Companies", "value": str(len(company_list)), "hint": "legal entities"},
+            {"label": "NGOs", "value": str(len(ngo_list)), "hint": "civil society"},
+            {"label": "Linked tenders", "value": str(len(linked_tenders)), "hint": "procurement"},
+            {"label": "Linked EU", "value": str(len(linked_projects)), "hint": "funding"},
+        ],
+        "highlights": highlights,
+        "chart": _counter_chart(raion_counts, unit_label="entity(s)"),
+        "stories": stories,
+        "routes": [
+            {"label": "Companies", "href": "/v1/companies/search"},
+            {"label": "NGOs", "href": "/v1/ngos/search"},
+            {"label": "Discovery", "href": "/v1/search"},
+        ],
+    }
+
+
+def _build_legislation_module(editions: list[dict[str, Any]], articles: list[dict[str, Any]]) -> dict[str, Any]:
+    editions_sorted = sorted(
+        editions,
+        key=lambda item: (item.get("published_at") or "", item.get("edition_number") or ""),
+        reverse=True,
+    )
+    articles_sorted = sorted(articles, key=lambda item: (item.get("edition_key") or "", item.get("article_key") or ""))
+    article_counts = Counter(article.get("edition_key") or "Unknown" for article in articles_sorted)
+    chart = _counter_chart(article_counts, unit_label="article(s)")
+
+    stories: list[dict[str, Any]] = []
+    if editions_sorted:
+        edition = editions_sorted[0]
+        edition_articles = [article for article in articles_sorted if article.get("edition_key") == edition.get("edition_key")]
+        stories.append(
+            _make_story(
+                story_id=edition["edition_key"],
+                kicker="Edition",
+                title=edition["title"],
+                meta=f"{edition.get('edition_number') or 'Unknown edition'} · {_format_datetime(edition.get('published_at'))}",
+                value=f"{len(edition_articles)} article(s)",
+                blurb=edition.get("summary") or "Official Gazette edition from Monitorul Oficial.",
+                detail=f"PDF: {edition.get('pdf_url') or 'n/a'}",
+                route=f"/v1/legislation/{edition['edition_key']}",
+                route_label="Open edition",
+                tags=["Official Gazette", edition.get("edition_number") or "Edition"],
+                tone="live" if edition.get("published_at") else "ready",
+            )
+        )
+
+    if articles_sorted:
+        article = articles_sorted[0]
+        stories.append(
+            _make_story(
+                story_id=article["article_key"],
+                kicker="Article",
+                title=article["title"],
+                meta=f"{article.get('article_number') or 'summary'} · {article.get('edition_key')}",
+                value=article.get("article_number") or "summary",
+                blurb=article.get("content_snippet") or "Legislation article snippet.",
+                detail=f"Source: {article.get('source_url')}",
+                route=f"/v1/legislation/{article['edition_key']}",
+                route_label="Open edition",
+                secondary_route="/v1/legislation/search?q=",
+                secondary_label="Search legislation",
+                tags=["Article", "Monitorul"],
+                tone="ready",
+            )
+        )
+
+    if not stories:
+        stories.append(
+            _make_story(
+                story_id="legislation-empty",
+                kicker="Monitorul",
+                title="No official gazette entries yet",
+                meta="Waiting for sync",
+                value="—",
+                blurb="The legislation module will populate when Monitorul Oficial pages are synced.",
+                detail="Search edition numbers, article snippets, or terms once records are available.",
+                route="/v1/legislation/search?q=",
+                route_label="Open legislation search",
+                tags=["Placeholder"],
+                tone="placeholder",
+            )
+        )
+
+    latest_edition = editions_sorted[0] if editions_sorted else {}
+    highlights = [
+        f"{len(editions_sorted)} edition(s) and {len(articles_sorted)} article(s) are indexed.",
+        "Search jumps to editions or article snippets instead of forcing raw PDF inspection.",
+        f"Latest visible edition: {latest_edition.get('edition_number') or 'n/a'}.",
+    ]
+
+    return {
+        "id": "legislation",
+        "kind": "legislation",
+        "kicker": "Monitorul Oficial",
+        "name": "Official Gazette",
+        "state": "live" if editions_sorted or articles_sorted else "placeholder",
+        "detail": f"{len(editions_sorted)} editions and {len(articles_sorted)} searchable articles.",
+        "note": "Legislation becomes article-level search with edition deep links.",
+        "accent": "#f7bf65",
+        "cross_link_count": 0,
+        "metrics": [
+            {"label": "Editions", "value": str(len(editions_sorted)), "hint": "gazette issues"},
+            {"label": "Articles", "value": str(len(articles_sorted)), "hint": "snippets"},
+            {"label": "Indexed editions", "value": str(len(article_counts)), "hint": "article groups"},
+            {"label": "Latest", "value": latest_edition.get("edition_number") or "n/a", "hint": "edition"},
+        ],
+        "highlights": highlights,
+        "chart": chart,
+        "stories": stories,
+        "routes": [
+            {"label": "Search legislation", "href": "/v1/legislation/search"},
+            {"label": "Official Gazette", "href": "/v1/legislation"},
+        ],
+    }
+
+
+def _build_geospatial_module(layers: list[dict[str, Any]]) -> dict[str, Any]:
+    layers_sorted = sorted(layers, key=lambda item: (item.get("title") or "").lower())
+    source_types = Counter((item.get("source_type") or "unknown").lower() for item in layers_sorted)
+    resource_total = sum(len((item.get("metadata") or {}).get("resources") or []) for item in layers_sorted)
+    chart = _counter_chart(source_types, unit_label="layer(s)")
+
+    stories: list[dict[str, Any]] = []
+    if layers_sorted:
+        layer = layers_sorted[0]
+        metadata = layer.get("metadata") or {}
+        resource_count = len(metadata.get("resources") or [])
+        stories.append(
+            _make_story(
+                story_id=layer["layer_key"],
+                kicker="Layer",
+                title=layer["title"],
+                meta=f"{layer.get('source_type') or 'ckan'} · {layer.get('source_url')}",
+                value=f"{resource_count} resource(s)",
+                blurb=layer.get("description") or "Geospatial layer from the open data portal.",
+                detail=f"Dataset ID: {metadata.get('dataset_id') or layer.get('layer_key')}",
+                route=f"/v1/geospatial/layers/{layer['layer_key']}",
+                route_label="Open layer",
+                secondary_route="/v1/geospatial/cadastre/search?q=",
+                secondary_label="Search geo extracts",
+                tags=[layer.get("source_type") or "ckan", "Geo"],
+                tone="live" if resource_count else "ready",
+            )
+        )
+
+    if len(layers_sorted) > 1:
+        layer = layers_sorted[1]
+        stories.append(
+            _make_story(
+                story_id=f"{layer['layer_key']}-secondary",
+                kicker="Layer",
+                title=layer["title"],
+                meta=f"{layer.get('source_type') or 'ckan'} · {layer.get('source_url')}",
+                value=f"{len((layer.get('metadata') or {}).get('resources') or [])} resource(s)",
+                blurb=layer.get("description") or "Secondary geospatial layer in the atlas.",
+                detail=f"Dataset ID: {(layer.get('metadata') or {}).get('dataset_id') or layer.get('layer_key')}",
+                route=f"/v1/geospatial/layers/{layer['layer_key']}",
+                route_label="Open layer",
+                tags=[layer.get("source_type") or "ckan", "Geo"],
+                tone="ready",
+            )
+        )
+
+    if not stories:
+        stories.append(
+            _make_story(
+                story_id="geo-empty",
+                kicker="Geo",
+                title="No geospatial layers yet",
+                meta="Waiting for sync",
+                value="—",
+                blurb="The geospatial module will populate when CKAN-backed layers have been synced.",
+                detail="Search layers or cadastre extracts once records are available.",
+                route="/v1/geospatial/layers",
+                route_label="Open layers",
+                tags=["Placeholder"],
+                tone="placeholder",
+            )
+        )
+
+    highlights = [
+        f"{len(layers_sorted)} geospatial layer(s) are indexed.",
+        f"{resource_total} resource file(s) are attached to visible layers.",
+        "Cadastre extracts and geographic names stay searchable from the same route family.",
+    ]
+
+    return {
+        "id": "geospatial",
+        "kind": "geospatial",
+        "kicker": "Geo / Cadastre",
+        "name": "Geospatial layers",
+        "state": "live" if layers_sorted else "placeholder",
+        "detail": f"{len(layers_sorted)} layers and {resource_total} resources from the open data portal.",
+        "note": "Spatial layers become a first-class search surface.",
+        "accent": "#85a8ff",
+        "cross_link_count": 0,
+        "metrics": [
+            {"label": "Layers", "value": str(len(layers_sorted)), "hint": "map rows"},
+            {"label": "Source types", "value": str(len(source_types)), "hint": "feeds"},
+            {"label": "Resources", "value": str(resource_total), "hint": "extracts"},
+            {"label": "Searchable", "value": "yes" if layers_sorted else "no", "hint": "cadastre"},
+        ],
+        "highlights": highlights,
+        "chart": chart,
+        "stories": stories,
+        "routes": [
+            {"label": "Layers", "href": "/v1/geospatial/layers"},
+            {"label": "Cadastre search", "href": "/v1/geospatial/cadastre/search"},
+        ],
+    }
+
+
+def _build_scenarios(modules: list[dict[str, Any]], bridge: dict[str, Any]) -> list[dict[str, Any]]:
+    module_lookup = {module["id"]: module for module in modules}
+    procurement = module_lookup.get("procurement", {})
+    eu_funds = module_lookup.get("eu-funds", {})
+    registers = module_lookup.get("registers", {})
+    legislation = module_lookup.get("legislation", {})
+    geospatial = module_lookup.get("geospatial", {})
+    datasets = module_lookup.get("datasets", {})
+    macro = module_lookup.get("macro", {})
+
+    return [
+        {
+            "id": "trace-procurement",
+            "kicker": "Procurement → EU",
+            "title": "Trace a public purchase",
+            "description": "Start with a tender, inspect the award and contract, then jump to the linked EU project.",
+            "query": "Chisinau",
+            "filter": "procurement",
+            "module_id": procurement.get("id", "procurement"),
+            "accent": procurement.get("accent", "#f7bf65"),
+            "routes": [
+                {"label": "Open tenders", "href": "/v1/procurement/tenders"},
+                {"label": "Open EU projects", "href": "/v1/eu-funds/projects"},
+            ],
+        },
+        {
+            "id": "trace-entity",
+            "kicker": "Registers → procurement",
+            "title": "Follow a company or NGO",
+            "description": "Look up a legal entity, inspect its cross-references, and jump into related tenders or grants.",
+            "query": "Example",
+            "filter": "registers",
+            "module_id": registers.get("id", "registers"),
+            "accent": registers.get("accent", "#76f0bf"),
+            "routes": [
+                {"label": "Search companies", "href": "/v1/companies/search"},
+                {"label": "Search NGOs", "href": "/v1/ngos/search"},
+            ],
+        },
+        {
+            "id": "read-legislation",
+            "kicker": "Monitorul Oficial",
+            "title": "Read official notices",
+            "description": "Search editions and article snippets instead of opening raw PDF pages first.",
+            "query": "Official",
+            "filter": "legislation",
+            "module_id": legislation.get("id", "legislation"),
+            "accent": legislation.get("accent", "#f7bf65"),
+            "routes": [
+                {"label": "Search legislation", "href": "/v1/legislation/search"},
+                {"label": "Open Gazette", "href": "/v1/legislation"},
+            ],
+        },
+        {
+            "id": "inspect-geo",
+            "kicker": "Geo / Cadastre",
+            "title": "Inspect the map layer stack",
+            "description": "Find spatial layers, cadastre extracts, and geographic names with a single query.",
+            "query": "Raion",
+            "filter": "geospatial",
+            "module_id": geospatial.get("id", "geospatial"),
+            "accent": geospatial.get("accent", "#85a8ff"),
+            "routes": [
+                {"label": "Open layers", "href": "/v1/geospatial/layers"},
+                {"label": "Search geo extracts", "href": "/v1/geospatial/cadastre/search"},
+            ],
+        },
+        {
+            "id": "open-data",
+            "kicker": "CKAN / datasets",
+            "title": "Find the original open dataset",
+            "description": "Start from the open data portal and move into the resources that feed the rest of the atlas.",
+            "query": "government",
+            "filter": "datasets",
+            "module_id": datasets.get("id", "datasets"),
+            "accent": datasets.get("accent", "#d7b6ff"),
+            "routes": [
+                {"label": "Open datasets", "href": "/v1/datasets"},
+                {"label": "Global search", "href": "/v1/search"},
+            ],
+        },
+        {
+            "id": "macro-pulse",
+            "kicker": "Macro signals",
+            "title": "Check the country’s pulse",
+            "description": "See exchange rates, weather, emergency alerts, and official statistics in one glance.",
+            "query": "MDL",
+            "filter": "macro",
+            "module_id": macro.get("id", "macro"),
+            "accent": macro.get("accent", "#85a8ff"),
+            "routes": [
+                {"label": "Exchange rates", "href": "/v1/finance/exchange-rates"},
+                {"label": "Weather", "href": "/v1/weather/current"},
+            ],
+        },
+        {
+            "id": "bridge-search",
+            "kicker": "Atlas search",
+            "title": "Search the whole system",
+            "description": bridge.get("detail") or "Run a free-text query across every source family.",
+            "query": "Chisinau",
+            "filter": "discovery",
+            "module_id": "discovery",
+            "accent": "#f49ac2",
+            "routes": [
+                {"label": "Discovery", "href": "/v1/search"},
+                {"label": "JSON payload", "href": "/status/data"},
+            ],
+        },
+    ]
 
 
 def _bridge_story(tenders: list[dict[str, Any]], projects: list[dict[str, Any]]) -> dict[str, Any]:
@@ -576,6 +1128,92 @@ STATUS_HTML = """<!doctype html>
     .summary-panel {
       margin-top: 18px;
       padding: 16px;
+    }
+
+    .scenario-panel {
+      margin-top: 18px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: linear-gradient(180deg, rgba(18, 29, 44, 0.9), rgba(11, 18, 28, 0.96));
+      box-shadow: var(--shadow);
+      scroll-margin-top: 20px;
+    }
+
+    .scenario-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .scenario-card {
+      text-align: left;
+      width: 100%;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 22px;
+      padding: 16px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.02)),
+        rgba(255, 255, 255, 0.02);
+      color: inherit;
+      cursor: pointer;
+      display: grid;
+      gap: 12px;
+      min-height: 190px;
+      position: relative;
+      overflow: hidden;
+      transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+    }
+
+    .scenario-card::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto auto 0;
+      width: 100%;
+      height: 3px;
+      background: var(--accent, var(--accent-3));
+    }
+
+    .scenario-card:hover,
+    .scenario-card.is-active {
+      transform: translateY(-2px);
+      border-color: rgba(118, 240, 191, 0.3);
+      background:
+        linear-gradient(180deg, rgba(118, 240, 191, 0.06), rgba(255, 255, 255, 0.02)),
+        rgba(255, 255, 255, 0.03);
+    }
+
+    .scenario-card h3 {
+      font-size: 1.14rem;
+      line-height: 1.15;
+      margin-bottom: 8px;
+    }
+
+    .scenario-card p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 0.9rem;
+    }
+
+    .scenario-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .scenario-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 9px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      color: var(--muted-strong);
+      font-size: 0.72rem;
+      letter-spacing: 0.02em;
     }
 
     .summary-grid {
@@ -1279,6 +1917,8 @@ STATUS_HTML = """<!doctype html>
       <nav class="nav">
         <a href="/">Home</a>
         <a href="/docs">API Docs</a>
+        <a href="#scenarios">Scenarios</a>
+        <a href="#modules">Modules</a>
         <a href="/v1/search">Discovery</a>
         <a href="/status" aria-current="page">Status</a>
         <a href="/openapi.json">API</a>
@@ -1293,8 +1933,8 @@ STATUS_HTML = """<!doctype html>
         </div>
         <h1>Explore the data, not the endpoints.</h1>
         <p class="lede" id="hero-lede">
-          The status page turns civic APIs into stories, charts, and cross-links so you can inspect procurement,
-          EU funding, macro signals, and discovery without reading raw JSON first.
+          The status page turns civic APIs into stories, scenarios, and cross-links so you can inspect procurement,
+          registries, legislation, geospatial layers, EU funding, and macro signals without reading raw JSON first.
         </p>
         <div class="hero-actions">
           <button class="button primary" id="refresh-button" type="button">Refresh now</button>
@@ -1332,6 +1972,24 @@ STATUS_HTML = """<!doctype html>
       </div>
     </section>
 
+    <section class="scenario-panel" id="scenarios" aria-labelledby="scenarios-title">
+      <div class="section-head">
+        <div class="section-copy">
+          <div class="section-kicker">Scenario deck</div>
+          <h2 id="scenarios-title">Choose an entry point into the atlas</h2>
+          <p>Each card points to a real workflow, not a raw endpoint list, so people can explore by intent.</p>
+        </div>
+        <div class="section-state status-ready" id="scenario-count">loading</div>
+      </div>
+      <div class="scenario-grid" id="scenario-grid">
+        <div class="loading-shell" style="grid-column: 1 / -1;">
+          <div class="loading-line mid"></div>
+          <div class="loading-line short"></div>
+          <div class="loading-line mid"></div>
+        </div>
+      </div>
+    </section>
+
     <section class="summary-panel" aria-label="Summary">
       <div class="summary-grid" id="summary-grid"></div>
     </section>
@@ -1345,7 +2003,7 @@ STATUS_HTML = """<!doctype html>
     </section>
 
     <div class="content">
-      <section class="section-card" aria-labelledby="board-title">
+      <section class="section-card" id="modules" aria-labelledby="board-title">
         <div class="section-head">
           <div class="section-copy">
             <div class="section-kicker">Story board</div>
@@ -1395,6 +2053,7 @@ STATUS_HTML = """<!doctype html>
       filter: "all",
       activeModuleId: null,
       activeStoryId: null,
+      activeScenarioId: null,
       autoRefresh: true,
       refreshTimer: null
     };
@@ -1408,8 +2067,12 @@ STATUS_HTML = """<!doctype html>
 
     const filterLabels = {
       all: "All",
-      civic: "Civic",
-      eu: "EU",
+      procurement: "Procurement",
+      eu: "EU funds",
+      registers: "Registers",
+      legislation: "Legislation",
+      geospatial: "Geospatial",
+      datasets: "Open data",
       macro: "Macro",
       discovery: "Discovery",
       linked: "Cross-linked"
@@ -2043,9 +2706,9 @@ def _build_procurement_module(
 
     return {
         "id": "procurement",
-        "kind": "civic",
+        "kind": "procurement",
         "kicker": "MTender / OCDS",
-        "name": "Civic procurement",
+        "name": "Procurement",
         "state": "live" if tenders else "placeholder",
         "detail": f"{len(tenders)} tenders, {len(awards)} awards, {len(contracts)} contracts, {len(budgets)} budgets, and {len(plans)} plans. The view is raion-aware and cross-linked to EU funding.",
         "note": "OCDS-normalized procurement with raion filtering and link stitching.",
@@ -2409,7 +3072,7 @@ def _build_discovery_module(catalog: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 async def build_status_payload() -> dict[str, object]:
-    finance_snapshot, weather_snapshot, alerts, tenders, awards, contracts, budgets, plans, procurement_stats, projects, eu_stats, stats, catalog = await asyncio.gather(
+    finance_snapshot, weather_snapshot, alerts, tenders, awards, contracts, budgets, plans, procurement_stats, projects, eu_stats, stats, datasets, companies, ngos, editions, articles, layers, catalog = await asyncio.gather(
         _safe_call("finance", get_exchange_rates(), {}),
         _safe_call("weather", get_current_weather(), {}),
         _safe_call("alerts", get_emergency_alerts(), []),
@@ -2422,6 +3085,12 @@ async def build_status_payload() -> dict[str, object]:
         _safe_call("eu projects", list_projects(status=None, sector=None, raion=None), []),
         _safe_call("eu stats", funding_statistics(), {}),
         _safe_call("statistics", get_statistics_summary(), []),
+        _safe_call("datasets", asyncio.to_thread(list_datasets, query=None, sync_if_empty=False), []),
+        _safe_call("companies", asyncio.to_thread(list_entities, "company", query=None, sync_if_empty=False), []),
+        _safe_call("ngos", asyncio.to_thread(list_entities, "ngo", query=None, sync_if_empty=False), []),
+        _safe_call("legislation editions", asyncio.to_thread(list_editions, query=None, sync_if_empty=False), []),
+        _safe_call("legislation articles", asyncio.to_thread(list_articles, query=None, sync_if_empty=False), []),
+        _safe_call("geospatial layers", asyncio.to_thread(list_layers, query=None, sync_if_empty=False), []),
         _safe_call("catalog", search_sources(q=""), []),
     )
 
@@ -2437,26 +3106,47 @@ async def build_status_payload() -> dict[str, object]:
     projects = _dump(projects)
     eu_stats = _dump(eu_stats)
     stats = _dump(stats)
+    datasets = _dump(datasets)
+    companies = _dump(companies)
+    ngos = _dump(ngos)
+    editions = _dump(editions)
+    articles = _dump(articles)
+    layers = _dump(layers)
     catalog = _dump(catalog)
 
     procurement_module = _build_procurement_module(tenders, awards, contracts, budgets, plans, procurement_stats)
     eu_module = _build_eu_module(projects, eu_stats)
+    registers_module = _build_registers_module(companies, ngos)
+    legislation_module = _build_legislation_module(editions, articles)
+    geospatial_module = _build_geospatial_module(layers)
+    datasets_module = _build_datasets_module(datasets)
     macro_module = _build_macro_module(finance_snapshot, weather_snapshot, alerts, stats)
     discovery_module = _build_discovery_module(catalog)
 
-    modules = [procurement_module, eu_module, macro_module, discovery_module]
+    modules = [
+        procurement_module,
+        eu_module,
+        registers_module,
+        legislation_module,
+        geospatial_module,
+        datasets_module,
+        macro_module,
+        discovery_module,
+    ]
     bridge = _bridge_story(tenders, projects)
+    scenarios = _build_scenarios(modules, bridge)
     live_modules = sum(1 for module in modules if module["state"] == "live")
     total_stories = sum(len(module["stories"]) for module in modules)
+    total_routes = sum(len(module.get("routes") or []) for module in modules)
 
-    overall_state = "operational" if live_modules >= 2 else "warming up"
+    overall_state = "operational" if live_modules >= 4 else "warming up"
     overall_class = "status-live" if overall_state == "operational" else "status-ready"
 
     hero_metrics = [
-        {"label": "modules live", "value": str(live_modules)},
+        {"label": "families live", "value": str(live_modules)},
         {"label": "stories", "value": str(total_stories)},
         {"label": "cross-links", "value": str(bridge.get("count", 0))},
-        {"label": "catalog items", "value": str(len(catalog))},
+        {"label": "routes", "value": str(total_routes)},
     ]
 
     return {
@@ -2474,13 +3164,14 @@ async def build_status_payload() -> dict[str, object]:
             "class_name": overall_class,
         },
         "summary": [
-            {"label": "Modules", "value": str(len(modules))},
-            {"label": "Stories", "value": str(total_stories)},
-            {"label": "Live modules", "value": str(live_modules)},
+            {"label": "Source families", "value": str(len(modules))},
+            {"label": "Scenarios", "value": str(len(scenarios))},
+            {"label": "Live families", "value": str(live_modules)},
             {"label": "Cross-links", "value": str(bridge.get("count", 0))},
         ],
         "hero_metrics": hero_metrics,
         "sources": modules,
+        "scenarios": scenarios,
     }
 
 

@@ -105,9 +105,11 @@ def test_status_data(monkeypatch) -> None:
 
     payload = response.json()
     assert payload["overall"]["label"] == "operational"
-    assert payload["summary"][0]["label"] == "Modules"
-    assert payload["summary"][0]["value"] == "4"
-    assert payload["summary"][1]["label"] == "Stories"
-    assert int(payload["summary"][1]["value"]) >= 15
+    assert payload["summary"][0]["label"] == "Source families"
+    assert payload["summary"][0]["value"] == "8"
+    assert payload["summary"][1]["label"] == "Scenarios"
+    assert int(payload["summary"][1]["value"]) >= 6
+    assert payload["summary"][2]["label"] == "Live families"
     assert payload["bridge"]["count"] == 2
     assert any(module["id"] == "procurement" for module in payload["sources"])
+    assert len(payload["scenarios"]) >= 6
